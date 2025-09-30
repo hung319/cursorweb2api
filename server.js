@@ -3,6 +3,7 @@ const { webcrack } = require('webcrack');
 const parser = require('@babel/parser');
 const traverse = require('@babel/traverse').default;
 const t = require('@babel/types');
+const crypto = require('crypto').webcrypto;
 
 const app = express();
 const PORT = 3000;
@@ -221,6 +222,118 @@ app.post('/get_key', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// POST /get_x_is_human 接口
+app.post('/get_x_is_human', async (req, res) => {
+  try {
+    const { jscode, fp } = req.body;
+
+    if (!jscode) {
+      return res.status(400).json({ error: 'jscode is required' });
+    }
+
+    if (!fp) {
+      return res.status(400).json({ error: 'fp is required' });
+    }
+
+    // 1. 调用 get_key 获取参数
+    const keyResult = await processJsCode(jscode);
+    const { key, params, s } = keyResult;
+
+    if (!params || params.length < 5) {
+      return res.status(500).json({ error: 'Invalid params from get_key' });
+    }
+
+    // 2. 构建 Y 对象
+    const Y = {
+      p: false,
+      S: s,
+      w: {
+        v: fp.UNMASKED_RENDERER_WEBGL,
+        r: fp.UNMASKED_VENDOR_WEBGL
+      },
+      s: false,
+      h: false,
+      b: false,
+      d: false
+    };
+
+    // 3. 调用 D 函数进行加密
+    const encryptedData = await encryptData(key, Y);
+
+    // 4. 构建最终响应
+    const response = {
+      b: params[0],
+      v: params[2],
+      e: params[3],
+      s: encryptedData,
+      d: params[1],
+      vr: params[4]
+    };
+
+    res.json(response);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// D 函数：使用 PBKDF2 + AES-GCM 加密
+async function encryptData(H, Y) {
+  // 1. 生成 16 字节随机盐值
+  const X = crypto.getRandomValues(new Uint8Array(16));
+
+  // 2. 生成 12 字节随机 IV (初始化向量)
+  const P = crypto.getRandomValues(new Uint8Array(12));
+
+  // 3. 将密码字符串 H 导入为密钥材料
+  const O = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(H),
+    "PBKDF2",
+    false,
+    ["deriveBits", "deriveKey"]
+  );
+
+  // 4. 使用 PBKDF2 派生 AES-256 密钥
+  const G = await crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt: X,
+      iterations: 100000,
+      hash: "SHA-256"
+    },
+    O,
+    {
+      name: "AES-GCM",
+      length: 256
+    },
+    false,
+    ["encrypt"]
+  );
+
+  // 5. 使用 AES-GCM 加密数据
+  const dataString = JSON.stringify(Y);
+  const dataBytes = new TextEncoder().encode(dataString);
+
+  const encryptedData = await crypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv: P
+    },
+    G,
+    dataBytes
+  );
+
+  // 6. 组合 salt + iv + ciphertext 并转为 base64
+  const saltArray = Array.from(X);
+  const ivArray = Array.from(P);
+  const ciphertextArray = Array.from(new Uint8Array(encryptedData));
+
+  const combined = new Uint8Array([...saltArray, ...ivArray, ...ciphertextArray]);
+
+  // 转为 base64
+  return Buffer.from(combined).toString('base64');
+}
 
 // 提取 S 值
 function extractSValue(ast, functionName) {
